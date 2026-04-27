@@ -1,9 +1,5 @@
 dependencies:
   idf: '>=5.3'
-  espressif/cjson:
-    version: "^1.7.19"
-    matches:
-      - if: "idf_version >=6.0"
 description: ESP32 WiFi Configuration
 files:
   exclude:
@@ -12,4 +8,4 @@ files:
 license: MIT
 repository: https://github.com/78/esp-wifi-connect
 url: https://github.com/78/esp-wifi-connect
-version: 3.1.3
+version: 2.4.3

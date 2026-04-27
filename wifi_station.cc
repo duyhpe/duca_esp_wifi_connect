@@ -12,11 +12,14 @@
 #include <esp_system.h>
 #include "ssid_manager.h"
 
-#define TAG "WifiStation"
+#define TAG "wifi"
 #define WIFI_EVENT_CONNECTED BIT0
-#define WIFI_EVENT_STOPPED BIT1
-#define WIFI_EVENT_SCAN_DONE_BIT BIT2
 #define MAX_RECONNECT_COUNT 5
+
+WifiStation& WifiStation::GetInstance() {
+    static WifiStation instance;
+    return instance;
+}
 
 WifiStation::WifiStation() {
     // Create the event group
@@ -26,27 +29,21 @@ WifiStation::WifiStation() {
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("wifi", NVS_READONLY, &nvs);
     if (err != ESP_OK) {
-        max_tx_power_ = 0;
-        remember_bssid_ = 0;
-    } else {
-        err = nvs_get_i8(nvs, "max_tx_power", &max_tx_power_);
-        if (err != ESP_OK) {
-            max_tx_power_ = 0;
-        }
-        err = nvs_get_u8(nvs, "remember_bssid", &remember_bssid_);
-        if (err != ESP_OK) {
-            remember_bssid_ = 0;
-        }
-        nvs_close(nvs);
+        ESP_LOGE(TAG, "Failed to open NVS: %d", err);
     }
+    err = nvs_get_i8(nvs, "max_tx_power", &max_tx_power_);
+    if (err != ESP_OK) {
+        max_tx_power_ = 0;
+    }
+    err = nvs_get_u8(nvs, "remember_bssid", &remember_bssid_);
+    if (err != ESP_OK) {
+        remember_bssid_ = 0;
+    }
+    nvs_close(nvs);
 }
 
 WifiStation::~WifiStation() {
-    Stop();
-    if (event_group_) {
-        vEventGroupDelete(event_group_);
-        event_group_ = nullptr;
-    }
+    vEventGroupDelete(event_group_);
 }
 
 void WifiStation::AddAuth(const std::string &&ssid, const std::string &&password) {
@@ -55,44 +52,25 @@ void WifiStation::AddAuth(const std::string &&ssid, const std::string &&password
 }
 
 void WifiStation::Stop() {
-    ESP_LOGI(TAG, "Stopping WiFi station");
-    
-    // Unregister event handlers FIRST to prevent scan done from triggering connect
-    if (instance_any_id_ != nullptr) {
-        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id_);
-        instance_any_id_ = nullptr;
-    }
-    if (instance_got_ip_ != nullptr) {
-        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip_);
-        instance_got_ip_ = nullptr;
-    }
-
-    // Stop timer
     if (timer_handle_ != nullptr) {
         esp_timer_stop(timer_handle_);
         esp_timer_delete(timer_handle_);
         timer_handle_ = nullptr;
     }
-
-    // Now safe to stop scan, disconnect and stop WiFi (no event callbacks will fire)
-    esp_wifi_scan_stop();
-    esp_wifi_disconnect();
-    esp_wifi_stop();
-
-    if (station_netif_ != nullptr) {
-        esp_netif_destroy_default_wifi(station_netif_);
-        station_netif_ = nullptr;
+    
+    // 取消注册事件处理程序
+    if (instance_any_id_ != nullptr) {
+        ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id_));
+        instance_any_id_ = nullptr;
     }
-    
-    // Reset was_connected_ flag to prevent stale state from affecting subsequent sessions
-    was_connected_ = false;
+    if (instance_got_ip_ != nullptr) {
+        ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip_));
+        instance_got_ip_ = nullptr;
+    }
 
-    // Clear connected bit
-    xEventGroupClearBits(event_group_, WIFI_EVENT_CONNECTED);
-    
-    // Set stopped event AFTER cleanup is complete to unblock WaitForConnected
-    // This ensures no race condition with subsequent WiFi operations
-    xEventGroupSetBits(event_group_, WIFI_EVENT_STOPPED);
+    // Reset the WiFi stack
+    ESP_ERROR_CHECK(esp_wifi_stop());
+    ESP_ERROR_CHECK(esp_wifi_deinit());
 }
 
 void WifiStation::OnScanBegin(std::function<void()> on_scan_begin) {
@@ -107,20 +85,9 @@ void WifiStation::OnConnected(std::function<void(const std::string& ssid)> on_co
     on_connected_ = on_connected;
 }
 
-void WifiStation::OnDisconnected(std::function<void(int reason)> on_disconnected) {
-    on_disconnected_ = on_disconnected;
-}
-
 void WifiStation::Start() {
-    // Note: esp_netif_init() and esp_wifi_init() should be called once before calling this method
-    // WiFi driver is initialized by WifiManager::Initialize() and kept alive
-    
-    // Clear stopped event bit so WaitForConnected works properly
-    // Clear scan done bit so Stop() can wait for scan to complete
-    xEventGroupClearBits(event_group_, WIFI_EVENT_STOPPED | WIFI_EVENT_SCAN_DONE_BIT);
-    
-    // Create the default WiFi station interface
-    station_netif_ = esp_netif_create_default_wifi_sta();
+    // Initialize the TCP/IP stack
+    ESP_ERROR_CHECK(esp_netif_init());
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
@@ -132,6 +99,14 @@ void WifiStation::Start() {
                                                         &WifiStation::IpEventHandler,
                                                         this,
                                                         &instance_got_ip_));
+
+    // Create the default event loop
+    esp_netif_create_default_wifi_sta();
+
+    // Initialize the WiFi stack in station mode
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    cfg.nvs_enable = false;
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
@@ -153,10 +128,7 @@ void WifiStation::Start() {
 }
 
 bool WifiStation::WaitForConnected(int timeout_ms) {
-    // Wait for either connected or stopped event
-    auto bits = xEventGroupWaitBits(event_group_, WIFI_EVENT_CONNECTED | WIFI_EVENT_STOPPED, 
-                                    pdFALSE, pdFALSE, timeout_ms / portTICK_PERIOD_MS);
-    // Return true only if connected (not if stopped)
+    auto bits = xEventGroupWaitBits(event_group_, WIFI_EVENT_CONNECTED, pdFALSE, pdFALSE, timeout_ms / portTICK_PERIOD_MS);
     return (bits & WIFI_EVENT_CONNECTED) != 0;
 }
 
@@ -187,8 +159,7 @@ void WifiStation::HandleScanResult() {
                 .ssid = it->ssid,
                 .password = it->password,
                 .channel = ap_record.primary,
-                .authmode = ap_record.authmode,
-                .bssid = {0}
+                .authmode = ap_record.authmode
             };
             memcpy(record.bssid, ap_record.bssid, 6);
             connect_queue_.push_back(record);
@@ -197,9 +168,8 @@ void WifiStation::HandleScanResult() {
     free(ap_records);
 
     if (connect_queue_.empty()) {
-        ESP_LOGI(TAG, "No AP found, next scan in %d seconds", scan_current_interval_microseconds_ / 1000 / 1000);
-        esp_timer_start_once(timer_handle_, scan_current_interval_microseconds_);
-        UpdateScanInterval();
+        ESP_LOGI(TAG, "Wait for next scan");
+        esp_timer_start_once(timer_handle_, 10 * 1000);
         return;
     }
 
@@ -225,7 +195,6 @@ void WifiStation::StartConnect() {
         memcpy(wifi_config.sta.bssid, ap_record.bssid, 6);
         wifi_config.sta.bssid_set = true;
     }
-    wifi_config.sta.listen_interval = 10;
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
     reconnect_count_ = 0;
@@ -233,34 +202,16 @@ void WifiStation::StartConnect() {
 }
 
 int8_t WifiStation::GetRssi() {
-    // Check if connected first
-    if (!IsConnected()) {
-        return 0;  // Return 0 if not connected
-    }
-    
     // Get station info
     wifi_ap_record_t ap_info;
-    esp_err_t err = esp_wifi_sta_get_ap_info(&ap_info);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to get AP info: %s", esp_err_to_name(err));
-        return 0;
-    }
+    ESP_ERROR_CHECK(esp_wifi_sta_get_ap_info(&ap_info));
     return ap_info.rssi;
 }
 
 uint8_t WifiStation::GetChannel() {
-    // Check if connected first
-    if (!IsConnected()) {
-        return 0;  // Return 0 if not connected
-    }
-    
     // Get station info
     wifi_ap_record_t ap_info;
-    esp_err_t err = esp_wifi_sta_get_ap_info(&ap_info);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to get AP info: %s", esp_err_to_name(err));
-        return 0;
-    }
+    ESP_ERROR_CHECK(esp_wifi_sta_get_ap_info(&ap_info));
     return ap_info.primary;
 }
 
@@ -268,40 +219,8 @@ bool WifiStation::IsConnected() {
     return xEventGroupGetBits(event_group_) & WIFI_EVENT_CONNECTED;
 }
 
-void WifiStation::SetScanIntervalRange(int min_interval_seconds, int max_interval_seconds) {
-    scan_min_interval_microseconds_ = min_interval_seconds * 1000 * 1000;
-    scan_max_interval_microseconds_ = max_interval_seconds * 1000 * 1000;
-    scan_current_interval_microseconds_ = scan_min_interval_microseconds_;
-}
-
-void WifiStation::SetPowerSaveLevel(WifiPowerSaveLevel level) {
-    wifi_ps_type_t ps_type;
-    switch (level) {
-        case WifiPowerSaveLevel::LOW_POWER:
-            ps_type = WIFI_PS_MAX_MODEM;  // Maximum power saving
-            ESP_LOGI(TAG, "Setting WiFi power save level: LOW_POWER (MAX_MODEM)");
-            break;
-        case WifiPowerSaveLevel::BALANCED:
-            ps_type = WIFI_PS_MIN_MODEM;  // Minimum power saving
-            ESP_LOGI(TAG, "Setting WiFi power save level: BALANCED (MIN_MODEM)");
-            break;
-        case WifiPowerSaveLevel::PERFORMANCE:
-        default:
-            ps_type = WIFI_PS_NONE;       // No power saving
-            ESP_LOGI(TAG, "Setting WiFi power save level: PERFORMANCE (NONE)");
-            break;
-    }
-    ESP_ERROR_CHECK(esp_wifi_set_ps(ps_type));
-}
-
-void WifiStation::UpdateScanInterval() {
-    // Apply exponential backoff: double the interval, up to max
-    if (scan_current_interval_microseconds_ < scan_max_interval_microseconds_) {
-        scan_current_interval_microseconds_ *= 2;
-        if (scan_current_interval_microseconds_ > scan_max_interval_microseconds_) {
-            scan_current_interval_microseconds_ = scan_max_interval_microseconds_;
-        }
-    }
+void WifiStation::SetPowerSaveMode(bool enabled) {
+    ESP_ERROR_CHECK(esp_wifi_set_ps(enabled ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE));
 }
 
 // Static event handler functions
@@ -313,20 +232,9 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
             this_->on_scan_begin_();
         }
     } else if (event_id == WIFI_EVENT_SCAN_DONE) {
-        xEventGroupSetBits(this_->event_group_, WIFI_EVENT_SCAN_DONE_BIT);
         this_->HandleScanResult();
     } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(this_->event_group_, WIFI_EVENT_CONNECTED);
-        
-        // Notify disconnected callback only once when transitioning from connected to disconnected
-        bool was_connected = this_->was_connected_;
-        this_->was_connected_ = false;
-        wifi_event_sta_disconnected_t* event = static_cast<wifi_event_sta_disconnected_t*>(event_data);
-        ESP_LOGI(TAG, "WiFi disconnected, reason: %d", event->reason);
-        if (was_connected && this_->on_disconnected_) {
-            this_->on_disconnected_(event->reason);
-        }
-        
         if (this_->reconnect_count_ < MAX_RECONNECT_COUNT) {
             esp_wifi_connect();
             this_->reconnect_count_++;
@@ -339,10 +247,8 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
             return;
         }
         
-        ESP_LOGI(TAG, "No more AP to connect, next scan in %d seconds", 
-                 this_->scan_current_interval_microseconds_ / 1000 / 1000);
-        esp_timer_start_once(this_->timer_handle_, this_->scan_current_interval_microseconds_);
-        this_->UpdateScanInterval();
+        ESP_LOGI(TAG, "No more AP to connect, wait for next scan");
+        esp_timer_start_once(this_->timer_handle_, 10 * 1000);
     } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
     }
 }
@@ -357,13 +263,9 @@ void WifiStation::IpEventHandler(void* arg, esp_event_base_t event_base, int32_t
     ESP_LOGI(TAG, "Got IP: %s", this_->ip_address_.c_str());
     
     xEventGroupSetBits(this_->event_group_, WIFI_EVENT_CONNECTED);
-    this_->was_connected_ = true;  // Mark as connected for disconnect notification
     if (this_->on_connected_) {
         this_->on_connected_(this_->ssid_);
     }
     this_->connect_queue_.clear();
     this_->reconnect_count_ = 0;
-    
-    // Reset scan interval to minimum for fast reconnect if disconnected later
-    this_->scan_current_interval_microseconds_ = this_->scan_min_interval_microseconds_;
 }
