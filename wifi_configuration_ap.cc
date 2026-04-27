@@ -13,8 +13,11 @@
 #include <nvs.h>
 #include <nvs_flash.h>
 #include <cJSON.h>
+#if !CONFIG_IDF_TARGET_ESP32P4
 #include <esp_smartconfig.h>
+#endif
 #include "ssid_manager.h"
+#include "sdkconfig.h"
 
 #define TAG "WifiConfigurationAp"
 
@@ -24,32 +27,29 @@
 extern const char index_html_start[] asm("_binary_wifi_configuration_html_start");
 extern const char done_html_start[] asm("_binary_wifi_configuration_done_html_start");
 
-WifiConfigurationAp& WifiConfigurationAp::GetInstance() {
-    static WifiConfigurationAp instance;
-    return instance;
-}
-
 WifiConfigurationAp::WifiConfigurationAp()
 {
     event_group_ = xEventGroupCreate();
     language_ = "zh-CN";
+    sleep_mode_ = false;
+    instance_any_id_ = nullptr;
+    instance_got_ip_ = nullptr;
+    max_tx_power_ = 0;
+    remember_bssid_ = false;
 }
+
+std::vector<wifi_ap_record_t> WifiConfigurationAp::GetAccessPoints()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ap_records_;
+}   
 
 WifiConfigurationAp::~WifiConfigurationAp()
 {
-    if (scan_timer_) {
-        esp_timer_stop(scan_timer_);
-        esp_timer_delete(scan_timer_);
-    }
+    Stop();
     if (event_group_) {
         vEventGroupDelete(event_group_);
-    }
-    // Unregister event handlers if they were registered
-    if (instance_any_id_) {
-        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id_);
-    }
-    if (instance_got_ip_) {
-        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip_);
+        event_group_ = nullptr;
     }
 }
 
@@ -58,7 +58,17 @@ void WifiConfigurationAp::SetLanguage(const std::string &&language)
     language_ = language;
 }
 
+void WifiConfigurationAp::SetLanguage(const std::string &language)
+{
+    language_ = language;
+}
+
 void WifiConfigurationAp::SetSsidPrefix(const std::string &&ssid_prefix)
+{
+    ssid_prefix_ = ssid_prefix;
+}
+
+void WifiConfigurationAp::SetSsidPrefix(const std::string &ssid_prefix)
 {
     ssid_prefix_ = ssid_prefix;
 }
@@ -120,10 +130,10 @@ std::string WifiConfigurationAp::GetWebServerUrl()
 
 void WifiConfigurationAp::StartAccessPoint()
 {
-    // Initialize the TCP/IP stack
-    ESP_ERROR_CHECK(esp_netif_init());
-
-    // Create the default event loop
+    // Note: esp_netif_init() and esp_wifi_init() should be called once before calling this method
+    // WiFi driver is initialized by WifiManager::Initialize() and kept alive
+    
+    // Create the default WiFi AP interface
     ap_netif_ = esp_netif_create_default_wifi_ap();
 
     // Set the router IP address to 192.168.4.1
@@ -134,12 +144,10 @@ void WifiConfigurationAp::StartAccessPoint()
     esp_netif_dhcps_stop(ap_netif_);
     esp_netif_set_ip_info(ap_netif_, &ip_info);
     esp_netif_dhcps_start(ap_netif_);
-    // Start the DNS server
-    dns_server_.Start(ip_info.gw);
 
-    // Initialize the WiFi stack in Access Point mode
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    // Start the DNS server
+    dns_server_ = std::make_unique<DnsServer>();
+    dns_server_->Start(ip_info.gw);
 
     // Get the SSID
     std::string ssid = GetSsid();
@@ -158,7 +166,8 @@ void WifiConfigurationAp::StartAccessPoint()
     ESP_ERROR_CHECK(esp_wifi_start());
 
 #ifdef CONFIG_SOC_WIFI_SUPPORT_5G
-    // Temporarily use only 2.4G Wi-Fi.
+    ESP_ERROR_CHECK(esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO));
+#else
     ESP_ERROR_CHECK(esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY));
 #endif
 
@@ -189,9 +198,18 @@ void WifiConfigurationAp::StartAccessPoint()
         uint8_t remember_bssid = 0;
         err = nvs_get_u8(nvs, "remember_bssid", &remember_bssid);
         if (err == ESP_OK) {
-            remember_bssid_ = remember_bssid;
+            remember_bssid_ = remember_bssid != 0;
         } else {
-            remember_bssid_ = true; // 默认值
+            remember_bssid_ = false; // 默认值
+        }
+
+        // 读取睡眠模式设置
+        uint8_t sleep_mode = 0;
+        err = nvs_get_u8(nvs, "sleep_mode", &sleep_mode);
+        if (err == ESP_OK) {
+            sleep_mode_ = sleep_mode != 0;
+        } else {
+            sleep_mode_ = true; // 默认值
         }
 
         nvs_close(nvs);
@@ -204,6 +222,9 @@ void WifiConfigurationAp::StartWebServer()
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 24;
     config.uri_match_fn = httpd_uri_match_wildcard;
+    // 5G Network takes longer to connect
+    config.recv_wait_timeout = 15;
+    config.send_wait_timeout = 15;
     ESP_ERROR_CHECK(httpd_start(&server_, &config));
 
     // Register the index.html file
@@ -250,7 +271,8 @@ void WifiConfigurationAp::StartWebServer()
             std::string uri = req->uri;
             auto pos = uri.find("?index=");
             if (pos != std::string::npos) {
-                int index = std::stoi(uri.substr(pos + 7));
+                int index = -1;
+                sscanf(&req->uri[pos+7], "%d", &index);
                 ESP_LOGI(TAG, "Set default item %d", index);
                 SsidManager::GetInstance().SetDefaultSsid(index);
             }
@@ -272,7 +294,8 @@ void WifiConfigurationAp::StartWebServer()
             std::string uri = req->uri;
             auto pos = uri.find("?index=");
             if (pos != std::string::npos) {
-                int index = std::stoi(uri.substr(pos + 7));
+                int index = -1;
+                sscanf(&req->uri[pos+7], "%d", &index);
                 ESP_LOGI(TAG, "Delete saved list item %d", index);
                 SsidManager::GetInstance().RemoveSsid(index);
             }
@@ -294,10 +317,18 @@ void WifiConfigurationAp::StartWebServer()
             auto *this_ = static_cast<WifiConfigurationAp *>(req->user_ctx);
             std::lock_guard<std::mutex> lock(this_->mutex_);
 
+            // Check if 5G is supported
+            bool support_5g = false;
+#ifdef CONFIG_SOC_WIFI_SUPPORT_5G
+            support_5g = true;
+#endif
+
             // Send the scan results as JSON
             httpd_resp_set_type(req, "application/json");
             httpd_resp_set_hdr(req, "Connection", "close");
-            httpd_resp_sendstr_chunk(req, "[");
+            httpd_resp_sendstr_chunk(req, "{\"support_5g\":");
+            httpd_resp_sendstr_chunk(req, support_5g ? "true" : "false");
+            httpd_resp_sendstr_chunk(req, ",\"aps\":[");
             for (int i = 0; i < this_->ap_records_.size(); i++) {
                 ESP_LOGI(TAG, "SSID: %s, RSSI: %d, Authmode: %d",
                     (char *)this_->ap_records_[i].ssid, this_->ap_records_[i].rssi, this_->ap_records_[i].authmode);
@@ -309,7 +340,7 @@ void WifiConfigurationAp::StartWebServer()
                     httpd_resp_sendstr_chunk(req, ",");
                 }
             }
-            httpd_resp_sendstr_chunk(req, "]");
+            httpd_resp_sendstr_chunk(req, "]}");
             httpd_resp_sendstr_chunk(req, NULL);
             return ESP_OK;
         },
@@ -358,15 +389,15 @@ void WifiConfigurationAp::StartWebServer()
             cJSON *ssid_item = cJSON_GetObjectItemCaseSensitive(json, "ssid");
             cJSON *password_item = cJSON_GetObjectItemCaseSensitive(json, "password");
 
-            if (!cJSON_IsString(ssid_item) || (ssid_item->valuestring == NULL)) {
+            if (!cJSON_IsString(ssid_item) || (ssid_item->valuestring == NULL) || (strlen(ssid_item->valuestring) >= 33)) {
                 cJSON_Delete(json);
-                httpd_resp_send(req, "{\"success\":false,\"error\":\"无效的 SSID\"}", HTTPD_RESP_USE_STRLEN);
+                httpd_resp_send(req, "{\"success\":false,\"error\":\"Invalid SSID\"}", HTTPD_RESP_USE_STRLEN);
                 return ESP_OK;
             }
 
             std::string ssid_str = ssid_item->valuestring;
             std::string password_str = "";
-            if (cJSON_IsString(password_item) && (password_item->valuestring != NULL)) {
+            if (cJSON_IsString(password_item) && (password_item->valuestring != NULL) && (strlen(password_item->valuestring) < 65)) {
                 password_str = password_item->valuestring;
             }
 
@@ -374,7 +405,7 @@ void WifiConfigurationAp::StartWebServer()
             auto *this_ = static_cast<WifiConfigurationAp *>(req->user_ctx);
             if (!this_->ConnectToWifi(ssid_str, password_str)) {
                 cJSON_Delete(json);
-                httpd_resp_send(req, "{\"success\":false,\"error\":\"无法连接到 WiFi\"}", HTTPD_RESP_USE_STRLEN);
+                httpd_resp_send(req, "{\"success\":false,\"error\":\"Failed to connect to the Access Point\"}", HTTPD_RESP_USE_STRLEN);
                 return ESP_OK;
             }
 
@@ -403,9 +434,9 @@ void WifiConfigurationAp::StartWebServer()
     };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server_, &done_html));
 
-    // Register the reboot endpoint
-    httpd_uri_t reboot = {
-        .uri = "/reboot",
+    // Register the exit endpoint - exits config mode without rebooting
+    httpd_uri_t exit_config = {
+        .uri = "/exit",
         .method = HTTP_POST,
         .handler = [](httpd_req_t *req) -> esp_err_t {
             auto* this_ = static_cast<WifiConfigurationAp*>(req->user_ctx);
@@ -417,31 +448,29 @@ void WifiConfigurationAp::StartWebServer()
             // 发送响应
             httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
             
-            // 创建一个延迟重启任务
-            ESP_LOGI(TAG, "Rebooting...");
+            // 延迟调用回调，确保HTTP响应完全发送
+            ESP_LOGI(TAG, "Exiting config mode...");
             xTaskCreate([](void *ctx) {
                 // 等待200ms确保HTTP响应完全发送
                 vTaskDelay(pdMS_TO_TICKS(200));
-                // 停止Web服务器
+                
                 auto* self = static_cast<WifiConfigurationAp*>(ctx);
-                if (self->server_) {
-                    httpd_stop(self->server_);
+                // 通知回调退出配网模式
+                if (self->on_exit_requested_) {
+                    self->on_exit_requested_();
                 }
-                // 再等待100ms确保所有连接都已关闭
-                vTaskDelay(pdMS_TO_TICKS(100));
-                // 执行重启
-                esp_restart();
-            }, "reboot_task", 4096, this_, 5, NULL);
+                vTaskDelete(NULL);
+            }, "exit_config_task", 4096, this_, 5, NULL);
             
             return ESP_OK;
         },
         .user_ctx = this
     };
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server_, &reboot));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server_, &exit_config));
 
     auto captive_portal_handler = [](httpd_req_t *req) -> esp_err_t {
         auto *this_ = static_cast<WifiConfigurationAp *>(req->user_ctx);
-        std::string url = this_->GetWebServerUrl() + "/?lang=" + this_->language_;
+        std::string url = this_->GetWebServerUrl() + "/?lang=" + this_->language_ + "&_=" + std::to_string(esp_timer_get_time());
         // Set content type to prevent browser warnings
         httpd_resp_set_type(req, "text/html");
         httpd_resp_set_status(req, "302 Found");
@@ -454,7 +483,7 @@ void WifiConfigurationAp::StartWebServer()
     // Register all common captive portal detection endpoints
     const char* captive_portal_urls[] = {
         "/hotspot-detect.html",    // Apple
-        "/generate_204",           // Android
+        "/generate_204*",           // Android
         "/mobile/status.php",      // Android
         "/check_network_status.txt", // Windows
         "/ncsi.txt",              // Windows
@@ -496,6 +525,7 @@ void WifiConfigurationAp::StartWebServer()
             }
             cJSON_AddNumberToObject(json, "max_tx_power", this_->max_tx_power_);
             cJSON_AddBoolToObject(json, "remember_bssid", this_->remember_bssid_);
+            cJSON_AddBoolToObject(json, "sleep_mode", this_->sleep_mode_);
 
             // 发送JSON响应
             char *json_str = cJSON_PrintUnformatted(json);
@@ -595,9 +625,19 @@ void WifiConfigurationAp::StartWebServer()
             cJSON *remember_bssid = cJSON_GetObjectItem(json, "remember_bssid");
             if (cJSON_IsBool(remember_bssid)) {
                 this_->remember_bssid_ = cJSON_IsTrue(remember_bssid);
-                err = nvs_set_u8(nvs, "remember_bssid", this_->remember_bssid_);
+                err = nvs_set_u8(nvs, "remember_bssid", this_->remember_bssid_ ? 1 : 0);
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "Failed to save remember_bssid: %d", err);
+                }
+            }
+
+            // 保存睡眠模式设置
+            cJSON *sleep_mode = cJSON_GetObjectItem(json, "sleep_mode");
+            if (cJSON_IsBool(sleep_mode)) {
+                this_->sleep_mode_ = cJSON_IsTrue(sleep_mode);
+                err = nvs_set_u8(nvs, "sleep_mode", this_->sleep_mode_ ? 1 : 0);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to save sleep_mode: %d", err);
                 }
             }
 
@@ -615,6 +655,9 @@ void WifiConfigurationAp::StartWebServer()
             httpd_resp_set_type(req, "application/json");
             httpd_resp_set_hdr(req, "Connection", "close");
             httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+
+            ESP_LOGI(TAG, "Saved settings: ota_url=%s, max_tx_power=%d, remember_bssid=%d, sleep_mode=%d",
+                this_->ota_url_.c_str(), this_->max_tx_power_, this_->remember_bssid_, this_->sleep_mode_);
             return ESP_OK;
         },
         .user_ctx = this
@@ -635,6 +678,11 @@ bool WifiConfigurationAp::ConnectToWifi(const std::string &ssid, const std::stri
         ESP_LOGE(TAG, "SSID too long");
         return false;
     }
+
+    if (password.length() > 64) {
+        ESP_LOGE(TAG, "Password too long");
+        return false;
+    }
     
     is_connecting_ = true;
     esp_wifi_scan_stop();
@@ -642,8 +690,8 @@ bool WifiConfigurationAp::ConnectToWifi(const std::string &ssid, const std::stri
 
     wifi_config_t wifi_config;
     bzero(&wifi_config, sizeof(wifi_config));
-    strcpy((char *)wifi_config.sta.ssid, ssid.c_str());
-    strcpy((char *)wifi_config.sta.password, password.c_str());
+    strlcpy((char *)wifi_config.sta.ssid, ssid.c_str(), 32);
+    strlcpy((char *)wifi_config.sta.password, password.c_str(), 64);
     wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     wifi_config.sta.failure_retry_cnt = 1;
     
@@ -656,8 +704,18 @@ bool WifiConfigurationAp::ConnectToWifi(const std::string &ssid, const std::stri
     }
     ESP_LOGI(TAG, "Connecting to WiFi %s", ssid.c_str());
 
-    // Wait for the connection to complete for 5 seconds
-    EventBits_t bits = xEventGroupWaitBits(event_group_, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
+    // Wait for the connection to complete for 10 or 25 seconds
+    EventBits_t bits = xEventGroupWaitBits(
+        event_group_,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdTRUE,
+        pdFALSE,
+#ifdef CONFIG_SOC_WIFI_SUPPORT_5G
+        pdMS_TO_TICKS(25000)
+#else
+        pdMS_TO_TICKS(10000)
+#endif
+    );
     is_connecting_ = false;
 
     if (bits & WIFI_CONNECTED_BIT) {
@@ -674,6 +732,11 @@ void WifiConfigurationAp::Save(const std::string &ssid, const std::string &passw
 {
     ESP_LOGI(TAG, "Save SSID %s %d", ssid.c_str(), ssid.length());
     SsidManager::GetInstance().AddSsid(ssid, password);
+}
+
+void WifiConfigurationAp::OnExitRequested(std::function<void()> callback)
+{
+    on_exit_requested_ = callback;
 }
 
 void WifiConfigurationAp::WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
@@ -712,6 +775,7 @@ void WifiConfigurationAp::IpEventHandler(void* arg, esp_event_base_t event_base,
     }
 }
 
+#if !CONFIG_IDF_TARGET_ESP32P4
 void WifiConfigurationAp::StartSmartConfig()
 {
     // 注册SmartConfig事件处理器
@@ -751,11 +815,16 @@ void WifiConfigurationAp::SmartConfigEventHandler(void *arg, esp_event_base_t ev
             ESP_LOGI(TAG, "SmartConfig SSID: %s, Password: %s", ssid, password);
             // 尝试连接WiFi会失败，故不连接
             self->Save(ssid, password);
+            // 延迟退出配网模式
             xTaskCreate([](void *ctx){
-                ESP_LOGI(TAG, "Restarting in 3 second");
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                esp_restart();
-            }, "restart_task", 4096, NULL, 5, NULL);
+                ESP_LOGI(TAG, "Exiting config mode in 1 second");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                auto* self = static_cast<WifiConfigurationAp*>(ctx);
+                if (self->on_exit_requested_) {
+                    self->on_exit_requested_();
+                }
+                vTaskDelete(NULL);
+            }, "exit_config_task", 4096, self, 5, NULL);
             break;
         }
         case SC_EVENT_SEND_ACK_DONE:
@@ -765,14 +834,17 @@ void WifiConfigurationAp::SmartConfigEventHandler(void *arg, esp_event_base_t ev
         }
     }
 }
+#endif // !CONFIG_IDF_TARGET_ESP32P4
 
 void WifiConfigurationAp::Stop() {
+#if !CONFIG_IDF_TARGET_ESP32P4
     // 停止SmartConfig服务
     if (sc_event_instance_) {
         esp_event_handler_instance_unregister(SC_EVENT, ESP_EVENT_ANY_ID, sc_event_instance_);
         sc_event_instance_ = nullptr;
     }
     esp_smartconfig_stop();
+#endif
 
     // 停止定时器
     if (scan_timer_) {
@@ -788,7 +860,10 @@ void WifiConfigurationAp::Stop() {
     }
 
     // 停止DNS服务器
-    dns_server_.Stop();
+    if (dns_server_) {
+        dns_server_->Stop();
+        dns_server_.reset();
+    }
 
     // 注销事件处理器
     if (instance_any_id_) {
@@ -800,14 +875,12 @@ void WifiConfigurationAp::Stop() {
         instance_got_ip_ = nullptr;
     }
 
-    // 停止WiFi并重置模式
+    // 停止WiFi（但不 deinit，WiFi 驱动由 WifiManager 管理）
     esp_wifi_stop();
-    esp_wifi_deinit();
-    esp_wifi_set_mode(WIFI_MODE_NULL);
-
-    // 释放网络接口资源
+    
+    // 销毁网络接口
     if (ap_netif_) {
-        esp_netif_destroy(ap_netif_);
+        esp_netif_destroy_default_wifi(ap_netif_);
         ap_netif_ = nullptr;
     }
 
