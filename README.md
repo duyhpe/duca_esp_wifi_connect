@@ -1,69 +1,75 @@
-# ESP32 Wi-Fi Connect
+# Kết nối Wi-Fi ESP32
+Thành phần này hỗ trợ kết nối Wi-Fi cho thiết bị.
 
-This component helps with Wi-Fi connection for the device.
+Đầu tiên, nó cố gắng kết nối với mạng Wi-Fi bằng cách sử dụng thông tin đăng nhập được lưu trữ trong flash. Nếu điều này không thành công, nó sẽ khởi động một điểm truy cập và một máy chủ web để cho phép người dùng kết nối với mạng Wi-Fi.
 
-It first tries to connect to a Wi-Fi network using the credentials stored in the flash. If this fails, it starts an access point and a web server to allow the user to connect to a Wi-Fi network.
-
-The URL to access the web server is `http://192.168.4.1`.
-
-### Screenshot: Wi-Fi Configuration
+URL để truy cập máy chủ web là `http://192.168.4.1`.
+### Ảnh chụp màn hình: Cấu hình Wi-Fi
 
 <img src="assets/ap_v3.png" width="320" alt="Wi-Fi Configuration">
 
-### Screenshot: Advanced Options
+### Ảnh chụp màn hình: Tùy chọn nâng cao
 
 <img src="assets/ap_v3_advanced.png" width="320" alt="Advanced Configuration">
 
-## Changelog: v3.1.0
+## Nhật ký thay đổi: v3.1.0
 
-- Event callback now includes an additional `data` parameter for extra information.
-- Disconnected event now provides the disconnect reason code via the `data` parameter.
-- This allows applications to handle different disconnect scenarios appropriately.
+- Gọi lại sự kiện hiện bao gồm một tham số `data` bổ sung để biết thêm thông tin.
 
-## Changelog: v3.0.0
+- Sự kiện bị ngắt kết nối hiện cung cấp mã lý do ngắt kết nối thông qua tham số `data`.
 
-- Added WifiManager class for unified WiFi connection management.
-- Improved DnsServer and WifiConfigurationAp classes for better resource handling.
-- Updated HTML for configuration success message to use exit endpoint instead of reboot.
-- Enhanced error handling and state management in WifiStation.
-- Cleaned up unused code and improved thread safety across components.
+- Điều này cho phép các ứng dụng xử lý các tình huống ngắt kết nối khác nhau một cách thích hợp.
+## Nhật ký thay đổi: v3.0.0
 
-## Changelog: v2.6.0
+- Đã thêm lớp WifiManager để quản lý kết nối WiFi thống nhất.
 
-- Add support for ESP32C5 5G mode.
+- Các lớp DnsServer và WifiConfigurationAp được cải thiện để xử lý tài nguyên tốt hơn.
 
-## Changelog: v2.4.0
+- Cập nhật HTML cho thông báo cấu hình thành công để sử dụng điểm cuối thoát thay vì khởi động lại.
 
-- Add ja / zh-TW languages.
-- Add advanced tab.
-- Add "Connection: close" headers to save open sockets.
+- Tăng cường xử lý lỗi và quản lý trạng thái trong WifiStation.
 
-## Changelog: v2.3.0
+- Dọn dẹp mã không sử dụng và cải thiện độ an toàn luồng trên các thành phần.
+## Nhật ký thay đổi: v2.6.0
 
-- Add support for language request.
+- Thêm hỗ trợ cho chế độ ESP32C5 5G.
 
-## Changelog: v2.2.0
+## Nhật ký thay đổi: v2.4.0
 
-- Add support for ESP32 SmartConfig(ESPTouch v2)
+- Thêm ngôn ngữ ja / zh-TW.
 
-## Changelog: v2.1.0
+- Thêm tab nâng cao.
 
-- Improve Wi-Fi connection logic.
+- Thêm tiêu đề "Kết nối: đóng" để lưu các ổ cắm đang mở.
 
-## Changelog: v2.0.0
+## Nhật ký thay đổi: v2.3.0
 
-- Add support for multiple Wi-Fi SSID management.
-- Auto switch to the best Wi-Fi network.
-- Captive portal for Wi-Fi configuration.
-- Support for multiple languages (English, Chinese).
+- Thêm hỗ trợ cho yêu cầu ngôn ngữ.
 
-## Configuration
+## Nhật ký thay đổi: v2.2.0
 
-The Wi-Fi credentials are stored in the flash under the "wifi" namespace.
+- Thêm hỗ trợ cho ESP32 SmartConfig (ESPTouch v2)
 
+## Nhật ký thay đổi: v2.1.0
+
+- Cải thiện logic kết nối Wi-Fi.
+
+## Nhật ký thay đổi: v2.0.0
+
+- Thêm hỗ trợ cho nhiều quản lý Wi-Fi SSID.
+
+- Tự động chuyển sang mạng Wi-Fi tốt nhất.
+
+- Cổng Captive cho cấu hình Wi-Fi.
+
+- Hỗ trợ nhiều ngôn ngữ (tiếng Anh, tiếng Trung).
+
+## Cấu hình
+
+Thông tin đăng nhập Wi-Fi được lưu trữ trong flash dưới không gian tên "wifi".
 The keys are "ssid", "ssid1", "ssid2" ... "ssid9", "password", "password1", "password2" ... "password9".
 
-## Usage
+## Cách sử dụng
 
 ```cpp
 #include <wifi_manager.h>
@@ -126,4 +132,4 @@ if (ssid_list.empty()) {
 }
 ```
 
-Please check https://github.com/78/xiaozhi-esp32 for more usage.
+Vui lòng kiểm tra https://github.com/78/xiaozhi-esp32 để biết thêm cách sử dụng.
